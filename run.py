@@ -102,12 +102,20 @@ parser.add_argument('--patience', type=int, default=100, help='early stopping pa
 parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
 parser.add_argument('--des', type=str, default='test', help='exp description')
 parser.add_argument('--loss', type=str, default='mse', help='loss function (for forecasting/classification)')
-parser.add_argument('--pointseg_loss', type=str, default='ce',
+parser.add_argument('--pointseg_loss', type=str, default='focal_dice',
                     help='loss for point segmentation: ce | focal | focal_dice')
 parser.add_argument('--focal_gamma', type=float, default=2.0,
                     help='gamma for focal loss (point segmentation)')
 parser.add_argument('--dice_weight', type=float, default=1.0,
                     help='dice term weight when using focal_dice loss (point segmentation)')
+parser.add_argument('--pointseg_balanced_sampling', type=str2bool, default=True,
+                    help='use weighted sampling to increase positive windows in point segmentation training')
+parser.add_argument('--pointseg_target_pos_ratio', type=float, default=0.5,
+                    help='target positive-window ratio for weighted sampling in point segmentation training')
+parser.add_argument('--pointseg_pos_jitter_std', type=float, default=0.02,
+                    help='std of gaussian jitter for positive windows (point segmentation)')
+parser.add_argument('--pointseg_pos_jitter_prob', type=float, default=0.5,
+                    help='probability of applying jitter augmentation to each positive window')
 parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
 parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)

@@ -9,6 +9,7 @@ import os
 import time
 import warnings
 import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 warnings.filterwarnings('ignore')
 
@@ -116,6 +117,59 @@ class Exp_PointSeg(Exp_Basic):
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
+
+    def _build_balanced_train_loader(self, train_data, fallback_loader):
+        """
+        使用 WeightedRandomSampler 在窗口级进行正样本过采样，提升训练中正窗口出现频率。
+        正窗口定义：窗口中至少存在一个正标签点。
+        """
+        use_sampling = getattr(self.args, 'pointseg_balanced_sampling', True)
+        if not use_sampling:
+            return fallback_loader
+
+        labels = getattr(train_data, "y", None)
+        if labels is None or len(labels) == 0:
+            return fallback_loader
+
+        pos_mask = (labels.sum(axis=1) > 0)
+        neg_mask = ~pos_mask
+        n_pos = int(pos_mask.sum())
+        n_neg = int(neg_mask.sum())
+        n_total = n_pos + n_neg
+        if n_total == 0 or n_pos == 0 or n_neg == 0:
+            return fallback_loader
+
+        target_pos_ratio = float(getattr(self.args, "pointseg_target_pos_ratio", 0.5))
+        target_pos_ratio = min(max(target_pos_ratio, 1e-4), 1 - 1e-4)
+        target_neg_ratio = 1.0 - target_pos_ratio
+
+        # 令 E[pos_ratio] ≈ target_pos_ratio
+        # 对每个窗口赋权：w_pos / w_neg = (target_pos_ratio / n_pos) / (target_neg_ratio / n_neg)
+        w_pos = target_pos_ratio / n_pos
+        w_neg = target_neg_ratio / n_neg
+        sample_weights = np.where(pos_mask, w_pos, w_neg).astype(np.float64)
+        sample_weights = torch.from_numpy(sample_weights)
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=n_total,
+            replacement=True,
+        )
+
+        print(
+            f"[Exp_PointSeg] balanced sampler enabled: "
+            f"windows total={n_total}, pos={n_pos}, neg={n_neg}, "
+            f"raw_pos_ratio={n_pos / n_total:.4f}, target_pos_ratio={target_pos_ratio:.4f}"
+        )
+
+        train_loader = DataLoader(
+            train_data,
+            batch_size=fallback_loader.batch_size,
+            sampler=sampler,
+            num_workers=fallback_loader.num_workers,
+            drop_last=fallback_loader.drop_last,
+        )
+        return train_loader
 
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -415,6 +469,7 @@ class Exp_PointSeg(Exp_Basic):
     def train(self, setting):
         # 直接使用预先划分好的 TRAIN / VAL 窗口
         train_data, train_loader = self._get_data(flag='TRAIN')
+        train_loader = self._build_balanced_train_loader(train_data, train_loader)
         _, vali_loader = self._get_data(flag='VAL')
 
         path = os.path.join(self.args.checkpoints, setting)
@@ -443,6 +498,18 @@ class Exp_PointSeg(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)            # [B, T, 1]
                 padding_mask = padding_mask.float().to(self.device)  # [B, T]
                 label = label.to(self.device)                        # [B, T]
+
+                # 正窗口轻量 jitter 增强（只作用于包含正标签点的窗口）
+                jitter_std = float(getattr(self.args, "pointseg_pos_jitter_std", 0.0))
+                jitter_prob = float(getattr(self.args, "pointseg_pos_jitter_prob", 0.5))
+                if jitter_std > 0:
+                    with torch.no_grad():
+                        pos_window_mask = (label.sum(dim=1) > 0)  # [B]
+                        if pos_window_mask.any():
+                            rand_mask = (torch.rand_like(pos_window_mask.float()) < jitter_prob) & pos_window_mask
+                            if rand_mask.any():
+                                noise = torch.randn_like(batch_x[rand_mask]) * jitter_std
+                                batch_x[rand_mask] = batch_x[rand_mask] + noise
 
                 outputs = self.model(batch_x, padding_mask, None, None)  # [B, T, C]
 
