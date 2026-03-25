@@ -102,7 +102,7 @@ parser.add_argument('--patience', type=int, default=100, help='early stopping pa
 parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
 parser.add_argument('--des', type=str, default='test', help='exp description')
 parser.add_argument('--loss', type=str, default='mse', help='loss function (for forecasting/classification)')
-parser.add_argument('--pointseg_loss', type=str, default='ce',
+parser.add_argument('--pointseg_loss', type=str, default='focal_dice',
                     help='loss for point segmentation: ce | focal | focal_dice')
 parser.add_argument('--focal_gamma', type=float, default=2.0,
                     help='gamma for focal loss (point segmentation)')
