@@ -89,6 +89,89 @@ def draw_event_axis(ax, events: List[Tuple[float, float]], color: str, title: st
         ax.axvline(e, color=color, linestyle="--", linewidth=0.8, alpha=0.8)
 
 
+def clip_events_to_range(events: List[Tuple[float, float]], start: float, end: float) -> List[Tuple[float, float]]:
+    clipped: List[Tuple[float, float]] = []
+    for s, e in events:
+        left = max(s, start)
+        right = min(e, end)
+        if right > left:
+            clipped.append((left, right))
+    return clipped
+
+
+def plot_detail_window(
+    excerpt_id: int,
+    t: np.ndarray,
+    signal: np.ndarray,
+    expert1: List[Tuple[float, float]],
+    expert2: List[Tuple[float, float]],
+    overlap_unions: List[Tuple[float, float]],
+    start: float,
+    end: float,
+    save_path: str,
+):
+    """
+    单张细节图（3行）：
+    1) EEG + overlap-union（红色）+ 两专家起止线
+    2) Expert1 事件条
+    3) Expert2 事件条
+    """
+    idx = np.where((t >= start) & (t <= end))[0]
+    if idx.size == 0:
+        return
+
+    local_t = t[idx]
+    local_x = signal[idx]
+
+    e1_local = clip_events_to_range(expert1, start, end)
+    e2_local = clip_events_to_range(expert2, start, end)
+    unions_local = clip_events_to_range(overlap_unions, start, end)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 5), sharex=True, gridspec_kw={"height_ratios": [3, 1, 1]})
+
+    ax0 = axes[0]
+    ax0.plot(local_t, local_x, color="black", linewidth=0.8)
+    for s, e in unions_local:
+        ax0.axvspan(s, e, color="red", alpha=0.22)
+
+    for s, e in e1_local:
+        ax0.axvline(s, color="#1f77b4", linewidth=0.8, alpha=0.55)
+        ax0.axvline(e, color="#1f77b4", linewidth=0.8, alpha=0.55, linestyle="--")
+    for s, e in e2_local:
+        ax0.axvline(s, color="#2ca02c", linewidth=0.8, alpha=0.55)
+        ax0.axvline(e, color="#2ca02c", linewidth=0.8, alpha=0.55, linestyle="--")
+
+    ax0.set_ylabel("EEG")
+    ax0.set_title(
+        f"Excerpt {excerpt_id} | detail window [{start:.2f}s, {end:.2f}s] (show spindle morphology)",
+        fontsize=11,
+    )
+
+    draw_event_axis(axes[1], e1_local, "#1f77b4", "Expert 1")
+    draw_event_axis(axes[2], e2_local, "#2ca02c", "Expert 2")
+    axes[2].set_xlabel("Time (s)")
+
+    line_eeg = plt.Line2D([], [], color="black", linewidth=1.0, label="EEG")
+    patch_overlap = plt.Rectangle((0, 0), 1, 1, color="red", alpha=0.22, label="Overlap-triggered union")
+    e1_start = plt.Line2D([], [], color="#1f77b4", linewidth=1.0, linestyle="-", label="Expert1 start")
+    e1_end = plt.Line2D([], [], color="#1f77b4", linewidth=1.0, linestyle="--", label="Expert1 end")
+    e2_start = plt.Line2D([], [], color="#2ca02c", linewidth=1.0, linestyle="-", label="Expert2 start")
+    e2_end = plt.Line2D([], [], color="#2ca02c", linewidth=1.0, linestyle="--", label="Expert2 end")
+    fig.legend(
+        handles=[line_eeg, patch_overlap, e1_start, e1_end, e2_start, e2_end],
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+    )
+
+    for ax in axes:
+        ax.set_xlim(start, end)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize overlap-based spindle labels for the first 6 excerpts.")
     parser.add_argument(
@@ -115,10 +198,32 @@ def main():
         default="expert_overlap_first6.png",
         help="Output figure path.",
     )
+    parser.add_argument(
+        "--detail_window_sec",
+        type=float,
+        default=3.0,
+        help="Window size (seconds) for detailed plots to inspect spindle morphology.",
+    )
+    parser.add_argument(
+        "--max_detail_per_excerpt",
+        type=int,
+        default=12,
+        help="Max number of detailed windows saved for each excerpt.",
+    )
+    parser.add_argument(
+        "--detail_output_dir",
+        type=str,
+        default="expert_overlap_detail_3s",
+        help="Directory to save detailed per-window figures.",
+    )
     args = parser.parse_args()
 
     n = args.num_excerpts
     fig, axes = plt.subplots(n, 3, figsize=(18, 3.0 * n), squeeze=False)
+    detail_dir = args.detail_output_dir
+    if not os.path.isabs(detail_dir):
+        detail_dir = os.path.join(args.data_dir, detail_dir)
+    os.makedirs(detail_dir, exist_ok=True)
 
     for i in range(1, n + 1):
         signal_path = os.path.join(args.data_dir, f"excerpt{i}.txt")
@@ -160,6 +265,35 @@ def main():
             ax.set_xlim(t[0], t[-1])
             ax.set_xlabel("Time (s)")
 
+        # 细化图：围绕 overlap-union 的中心，截取 3s EEG，便于观察纺锤波形状
+        half = 0.5 * float(args.detail_window_sec)
+        detailed = 0
+        for k, (s, e) in enumerate(overlap_unions):
+            if detailed >= int(args.max_detail_per_excerpt):
+                break
+            center = 0.5 * (s + e)
+            start = max(float(t[0]), center - half)
+            end = min(float(t[-1]), center + half)
+            if end - start < 1e-6:
+                continue
+
+            save_path = os.path.join(
+                detail_dir,
+                f"excerpt{i:02d}_detail_{k:03d}_{start:.2f}s_{end:.2f}s.png",
+            )
+            plot_detail_window(
+                excerpt_id=i,
+                t=t,
+                signal=signal,
+                expert1=expert1,
+                expert2=expert2,
+                overlap_unions=overlap_unions,
+                start=start,
+                end=end,
+                save_path=save_path,
+            )
+            detailed += 1
+
     # unified legend
     line_eeg = plt.Line2D([], [], color="black", linewidth=1.0, label="EEG")
     patch_overlap = plt.Rectangle((0, 0), 1, 1, color="red", alpha=0.20, label="Overlap-triggered union")
@@ -181,6 +315,7 @@ def main():
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
     print(f"saved: {out_path}")
+    print(f"saved detail windows in: {detail_dir}")
 
 
 if __name__ == "__main__":
