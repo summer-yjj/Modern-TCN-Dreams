@@ -9,6 +9,14 @@ import os
 import time
 import warnings
 import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from utils.pointseg_plots import (
+    plot_training_curves,
+    plot_point_confusion_matrix,
+    plot_point_vs_event_metrics,
+    plot_event_metric_bars,
+    plot_eeg_expert_prediction_panel,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -117,6 +125,59 @@ class Exp_PointSeg(Exp_Basic):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
+    def _build_balanced_train_loader(self, train_data, fallback_loader):
+        """
+        使用 WeightedRandomSampler 在窗口级进行正样本过采样，提升训练中正窗口出现频率。
+        正窗口定义：窗口中至少存在一个正标签点。
+        """
+        use_sampling = getattr(self.args, 'pointseg_balanced_sampling', True)
+        if not use_sampling:
+            return fallback_loader
+
+        labels = getattr(train_data, "y", None)
+        if labels is None or len(labels) == 0:
+            return fallback_loader
+
+        pos_mask = (labels.sum(axis=1) > 0)
+        neg_mask = ~pos_mask
+        n_pos = int(pos_mask.sum())
+        n_neg = int(neg_mask.sum())
+        n_total = n_pos + n_neg
+        if n_total == 0 or n_pos == 0 or n_neg == 0:
+            return fallback_loader
+
+        target_pos_ratio = float(getattr(self.args, "pointseg_target_pos_ratio", 0.5))
+        target_pos_ratio = min(max(target_pos_ratio, 1e-4), 1 - 1e-4)
+        target_neg_ratio = 1.0 - target_pos_ratio
+
+        # 令 E[pos_ratio] ≈ target_pos_ratio
+        # 对每个窗口赋权：w_pos / w_neg = (target_pos_ratio / n_pos) / (target_neg_ratio / n_neg)
+        w_pos = target_pos_ratio / n_pos
+        w_neg = target_neg_ratio / n_neg
+        sample_weights = np.where(pos_mask, w_pos, w_neg).astype(np.float64)
+        sample_weights = torch.from_numpy(sample_weights)
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=n_total,
+            replacement=True,
+        )
+
+        print(
+            f"[Exp_PointSeg] balanced sampler enabled: "
+            f"windows total={n_total}, pos={n_pos}, neg={n_neg}, "
+            f"raw_pos_ratio={n_pos / n_total:.4f}, target_pos_ratio={target_pos_ratio:.4f}"
+        )
+
+        train_loader = DataLoader(
+            train_data,
+            batch_size=fallback_loader.batch_size,
+            sampler=sampler,
+            num_workers=fallback_loader.num_workers,
+            drop_last=fallback_loader.drop_last,
+        )
+        return train_loader
+
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
@@ -210,6 +271,155 @@ class Exp_PointSeg(Exp_Basic):
         else:
             f1 = 0.0
         return dict(acc=float(acc), precision=float(precision), recall=float(recall), f1=float(f1))
+
+    def _binary_to_events(self, binary_1d: np.ndarray):
+        """
+        把 0/1 序列转换为闭区间事件列表 [(start, end), ...]。
+        """
+        if binary_1d.size == 0:
+            return []
+        arr = binary_1d.astype(int)
+        events = []
+        in_evt = False
+        s = 0
+        for i, v in enumerate(arr):
+            if v == 1 and not in_evt:
+                in_evt = True
+                s = i
+            elif v == 0 and in_evt:
+                in_evt = False
+                events.append((s, i - 1))
+        if in_evt:
+            events.append((s, len(arr) - 1))
+        return events
+
+    def _overlap(self, e1, e2):
+        s1, t1 = e1
+        s2, t2 = e2
+        left = max(s1, s2)
+        right = min(t1, t2)
+        return max(0, right - left + 1)
+
+    def _event_match_one_to_one(self, pred_events, true_events):
+        """
+        一对一重叠匹配：每个预测事件最多匹配一个真实事件，反之亦然。
+        判定匹配条件：事件有重叠（overlap > 0）。
+        """
+        matched_true = set()
+        tp = 0
+        for pe in pred_events:
+            best_j = -1
+            best_ov = 0
+            for j, te in enumerate(true_events):
+                if j in matched_true:
+                    continue
+                ov = self._overlap(pe, te)
+                if ov > best_ov:
+                    best_ov = ov
+                    best_j = j
+            if best_j >= 0 and best_ov > 0:
+                tp += 1
+                matched_true.add(best_j)
+        fp = max(0, len(pred_events) - tp)
+        fn = max(0, len(true_events) - tp)
+        return tp, fp, fn
+
+    def _event_level_metrics_from_batch(self, outputs, label, mask):
+        """
+        事件级评估：
+        1) 概率阈值二值化
+        2) 候选事件提取
+        3) 先去除过短事件，再合并间隔过近事件
+        4) 一对一重叠匹配计算 TP/FP/FN
+        """
+        probs = torch.softmax(outputs, dim=-1)[..., 1]  # [B, T]
+        pred_bin = (probs >= float(getattr(self.args, "pos_threshold", 0.2))).detach().cpu().numpy().astype(np.int64)
+        true_bin = label.detach().cpu().numpy().astype(np.int64)
+        mask_np = mask.detach().cpu().numpy().astype(np.int64)
+
+        fs = float(getattr(self.args, "fs", 256.0))
+        min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        one_to_one = bool(getattr(self.args, "event_one_to_one", True))
+
+        tp_all, fp_all, fn_all = 0, 0, 0
+        B = pred_bin.shape[0]
+        for b in range(B):
+            valid = mask_np[b] > 0
+            pred_seq = pred_bin[b][valid]
+            true_seq = true_bin[b][valid]
+
+            pred_events = self._postprocess_spindle_events(
+                pred_seq,
+                np.ones_like(pred_seq, dtype=np.int64),
+                fs=fs,
+                merge_gap_sec=merge_gap,
+                min_dur_sec=min_dur,
+                max_dur_sec=999.0,
+            )
+            true_events = self._binary_to_events(true_seq)
+
+            if one_to_one:
+                tp, fp, fn = self._event_match_one_to_one(pred_events, true_events)
+            else:
+                # 兜底：非一对一时仍以重叠命中为 TP（较宽松）
+                tp = 0
+                used_true = set()
+                for pe in pred_events:
+                    for j, te in enumerate(true_events):
+                        if self._overlap(pe, te) > 0:
+                            tp += 1
+                            used_true.add(j)
+                            break
+                fp = max(0, len(pred_events) - tp)
+                fn = max(0, len(true_events) - len(used_true))
+
+            tp_all += tp
+            fp_all += fp
+            fn_all += fn
+
+        precision = tp_all / (tp_all + fp_all) if (tp_all + fp_all) > 0 else 0.0
+        recall = tp_all / (tp_all + fn_all) if (tp_all + fn_all) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return dict(tp=tp_all, fp=fp_all, fn=fn_all, precision=precision, recall=recall, f1=f1)
+
+    def _extract_postprocessed_sequences(self, batch_x, outputs, label, mask):
+        """
+        提取每个样本的局部 EEG、真值点序列和后处理后的预测点序列（仅保留有效点）。
+        """
+        probs = torch.softmax(outputs, dim=-1)[..., 1]  # [B, T]
+        point_preds = (probs >= float(getattr(self.args, "pos_threshold", 0.2))).detach().cpu().numpy().astype(np.int64)
+        label_np = label.detach().cpu().numpy().astype(np.int64)
+        mask_np = mask.detach().cpu().numpy().astype(np.int64)
+        x_np = batch_x.detach().cpu().numpy().astype(np.float32)  # [B, T, C]
+
+        fs = float(getattr(self.args, "fs", 256.0))
+        min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+
+        out = []
+        B = point_preds.shape[0]
+        for b in range(B):
+            valid = mask_np[b] > 0
+            pred_seq = point_preds[b][valid]
+            true_seq = label_np[b][valid]
+            eeg_seq = x_np[b][valid, 0] if x_np.shape[-1] > 0 else x_np[b][valid]
+            pred_events = self._postprocess_spindle_events(
+                pred_seq,
+                np.ones_like(pred_seq, dtype=np.int64),
+                fs=fs,
+                merge_gap_sec=merge_gap,
+                min_dur_sec=min_dur,
+                max_dur_sec=999.0,
+            )
+            pred_post = self._events_to_point_preds(pred_events, np.ones_like(pred_seq, dtype=np.int64))
+            tp, fp, fn = self._event_match_one_to_one(pred_events, self._binary_to_events(true_seq))
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            out.append(dict(eeg=eeg_seq, true=true_seq, pred=pred_post, event_f1=f1))
+        return out
 
     def _postprocess_spindle_events(
         self,
@@ -382,6 +592,9 @@ class Exp_PointSeg(Exp_Basic):
         total_loss = []
         all_preds = []
         all_trues = []
+        event_tp = 0
+        event_fp = 0
+        event_fn = 0
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, label, padding_mask) in enumerate(vali_loader):
@@ -395,6 +608,10 @@ class Exp_PointSeg(Exp_Basic):
                     outputs, label, padding_mask, criterion
                 )
                 total_loss.append(loss.item())
+                evt = self._event_level_metrics_from_batch(outputs, label, padding_mask)
+                event_tp += evt["tp"]
+                event_fp += evt["fp"]
+                event_fn += evt["fn"]
 
                 if preds_flat.numel() > 0:
                     all_preds.append(preds_flat.detach().cpu())
@@ -405,16 +622,23 @@ class Exp_PointSeg(Exp_Basic):
         if all_preds:
             preds_cat = torch.cat(all_preds, dim=0).numpy()
             trues_cat = torch.cat(all_trues, dim=0).numpy()
-            metrics = self._pointwise_metrics(preds_cat, trues_cat)
+            point_metrics = self._pointwise_metrics(preds_cat, trues_cat)
         else:
-            metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+            point_metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+
+        event_precision = event_tp / (event_tp + event_fp) if (event_tp + event_fp) > 0 else 0.0
+        event_recall = event_tp / (event_tp + event_fn) if (event_tp + event_fn) > 0 else 0.0
+        event_f1 = 2 * event_precision * event_recall / (event_precision + event_recall) if (event_precision + event_recall) > 0 else 0.0
+        event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
+                             precision=event_precision, recall=event_recall, f1=event_f1)
 
         self.model.train()
-        return total_loss, metrics
+        return total_loss, point_metrics, event_metrics
 
     def train(self, setting):
         # 直接使用预先划分好的 TRAIN / VAL 窗口
         train_data, train_loader = self._get_data(flag='TRAIN')
+        train_loader = self._build_balanced_train_loader(train_data, train_loader)
         _, vali_loader = self._get_data(flag='VAL')
 
         path = os.path.join(self.args.checkpoints, setting)
@@ -428,6 +652,16 @@ class Exp_PointSeg(Exp_Basic):
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
+        history = {
+            "epoch": [],
+            "train_loss": [],
+            "val_loss": [],
+            "val_point_f1": [],
+            "val_event_f1": [],
+            "val_event_precision": [],
+            "val_event_recall": [],
+            "val_point_acc": [],
+        }
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -443,6 +677,18 @@ class Exp_PointSeg(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)            # [B, T, 1]
                 padding_mask = padding_mask.float().to(self.device)  # [B, T]
                 label = label.to(self.device)                        # [B, T]
+
+                # 正窗口轻量 jitter 增强（只作用于包含正标签点的窗口）
+                jitter_std = float(getattr(self.args, "pointseg_pos_jitter_std", 0.0))
+                jitter_prob = float(getattr(self.args, "pointseg_pos_jitter_prob", 0.5))
+                if jitter_std > 0:
+                    with torch.no_grad():
+                        pos_window_mask = (label.sum(dim=1) > 0)  # [B]
+                        if pos_window_mask.any():
+                            rand_mask = (torch.rand_like(pos_window_mask.float()) < jitter_prob) & pos_window_mask
+                            if rand_mask.any():
+                                noise = torch.randn_like(batch_x[rand_mask]) * jitter_std
+                                batch_x[rand_mask] = batch_x[rand_mask] + noise
 
                 outputs = self.model(batch_x, padding_mask, None, None)  # [B, T, C]
 
@@ -472,30 +718,43 @@ class Exp_PointSeg(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss) if train_loss else 0.0
-            vali_loss, val_metrics = self.vali(vali_loader, criterion)
+            vali_loss, val_point_metrics, val_event_metrics = self.vali(vali_loader, criterion)
 
             print(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} "
-                "Vali Loss: {3:.3f} Vali Acc: {4:.3f} Vali Prec: {5:.3f} "
-                "Vali Rec: {6:.3f} Vali F1: {7:.3f}".format(
+                "Vali Loss: {3:.3f} | Point F1: {4:.3f} | Event Prec: {5:.3f} "
+                "Event Rec: {6:.3f} Event F1: {7:.3f}".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
                     vali_loss,
-                    val_metrics["acc"],
-                    val_metrics["precision"],
-                    val_metrics["recall"],
-                    val_metrics["f1"],
+                    val_point_metrics["f1"],
+                    val_event_metrics["precision"],
+                    val_event_metrics["recall"],
+                    val_event_metrics["f1"],
                 )
             )
-            # 逐点分割任务建议盯 F1 做早停
-            early_stopping(-val_metrics["f1"], self.model, path)
+            # 默认基线：事件级 F1 作为核心早停指标
+            early_stopping(-val_event_metrics["f1"], self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
+            history["epoch"].append(epoch + 1)
+            history["train_loss"].append(float(train_loss))
+            history["val_loss"].append(float(vali_loss))
+            history["val_point_f1"].append(float(val_point_metrics["f1"]))
+            history["val_event_f1"].append(float(val_event_metrics["f1"]))
+            history["val_event_precision"].append(float(val_event_metrics["precision"]))
+            history["val_event_recall"].append(float(val_event_metrics["recall"]))
+            history["val_point_acc"].append(float(val_point_metrics["acc"]))
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
+
+        plot_dir = os.path.join("./results", setting, "plots")
+        plot_training_curves(history, plot_dir)
+        self.train_history = history
 
         return self.model
 
@@ -508,6 +767,10 @@ class Exp_PointSeg(Exp_Basic):
         total_loss = []
         all_preds = []
         all_trues = []
+        event_tp = 0
+        event_fp = 0
+        event_fn = 0
+        sample_cases = []
 
         self.model.eval()
         criterion = self._select_criterion()
@@ -523,6 +786,11 @@ class Exp_PointSeg(Exp_Basic):
                     outputs, label, padding_mask, criterion
                 )
                 total_loss.append(loss.item())
+                evt = self._event_level_metrics_from_batch(outputs, label, padding_mask)
+                event_tp += evt["tp"]
+                event_fp += evt["fp"]
+                event_fn += evt["fn"]
+                sample_cases.extend(self._extract_postprocessed_sequences(batch_x, outputs, label, padding_mask))
 
                 if preds_flat.numel() > 0:
                     all_preds.append(preds_flat.detach().cpu())
@@ -533,13 +801,23 @@ class Exp_PointSeg(Exp_Basic):
         if all_preds:
             preds_cat = torch.cat(all_preds, dim=0).numpy()
             trues_cat = torch.cat(all_trues, dim=0).numpy()
-            metrics = self._pointwise_metrics(preds_cat, trues_cat)
+            point_metrics = self._pointwise_metrics(preds_cat, trues_cat)
         else:
-            metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+            point_metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+
+        event_precision = event_tp / (event_tp + event_fp) if (event_tp + event_fp) > 0 else 0.0
+        event_recall = event_tp / (event_tp + event_fn) if (event_tp + event_fn) > 0 else 0.0
+        event_f1 = 2 * event_precision * event_recall / (event_precision + event_recall) if (event_precision + event_recall) > 0 else 0.0
+        event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
+                             precision=event_precision, recall=event_recall, f1=event_f1)
 
         print(
             "test point-wise metrics: "
-            "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**metrics)
+            "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**point_metrics)
+        )
+        print(
+            "test event-level metrics (one-to-one overlap): "
+            "TP={tp}, FP={fp}, FN={fn}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**event_metrics)
         )
 
         # result save
@@ -553,9 +831,71 @@ class Exp_PointSeg(Exp_Basic):
         f.write('\n')
         f.write(
             'point_acc:{:.6f}, point_prec:{:.6f}, point_rec:{:.6f}, point_f1:{:.6f}'.format(
-                metrics["acc"], metrics["precision"], metrics["recall"], metrics["f1"]
+                point_metrics["acc"], point_metrics["precision"], point_metrics["recall"], point_metrics["f1"]
+            )
+        )
+        f.write('\n')
+        f.write(
+            'event_tp:{}, event_fp:{}, event_fn:{}, event_prec:{:.6f}, event_rec:{:.6f}, event_f1:{:.6f}'.format(
+                event_metrics["tp"], event_metrics["fp"], event_metrics["fn"],
+                event_metrics["precision"], event_metrics["recall"], event_metrics["f1"]
             )
         )
         f.write('\n\n')
         f.close()
+
+        plot_dir = os.path.join("./results", setting, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        if all_preds:
+            y_pred = torch.cat(all_preds, dim=0).numpy()
+            y_true = torch.cat(all_trues, dim=0).numpy()
+            plot_point_confusion_matrix(y_true, y_pred, os.path.join(plot_dir, "point_confusion_matrix.png"))
+        plot_point_vs_event_metrics(point_metrics, event_metrics, os.path.join(plot_dir, "point_vs_event_metrics.png"))
+        plot_event_metric_bars(event_metrics, os.path.join(plot_dir, "event_metrics_bar.png"))
+
+        # EEG 可视化：成功 / 边界差异 / 失败
+        fs = float(getattr(self.args, "fs", 256.0))
+        success_case = next((c for c in sample_cases if c["event_f1"] >= 0.8), None)
+        boundary_case = next((c for c in sample_cases if 0.2 < c["event_f1"] < 0.8), None)
+        fail_case = next((c for c in sample_cases if c["event_f1"] <= 0.2), None)
+
+        def _pick_10_20s(arr_eeg, arr_true, arr_pred):
+            T = len(arr_eeg)
+            min_len = int(round(10 * fs))
+            max_len = int(round(20 * fs))
+            seg_len = min(T, max(min_len, min(max_len, T)))
+            if seg_len >= T:
+                return arr_eeg, arr_true, arr_pred
+            center = T // 2
+            start = max(0, center - seg_len // 2)
+            end = start + seg_len
+            return arr_eeg[start:end], arr_true[start:end], arr_pred[start:end]
+
+        if success_case is not None:
+            eeg, y, p = _pick_10_20s(success_case["eeg"], success_case["true"], success_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_success_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Success case",
+            )
+        if boundary_case is not None:
+            eeg, y, p = _pick_10_20s(boundary_case["eeg"], boundary_case["true"], boundary_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_boundary_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Boundary-difference case",
+            )
+        if fail_case is not None:
+            eeg, y, p = _pick_10_20s(fail_case["eeg"], fail_case["true"], fail_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_failure_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Failure case",
+            )
         return
