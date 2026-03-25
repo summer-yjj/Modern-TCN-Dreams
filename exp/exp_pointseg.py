@@ -10,6 +10,13 @@ import time
 import warnings
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from utils.pointseg_plots import (
+    plot_training_curves,
+    plot_point_confusion_matrix,
+    plot_point_vs_event_metrics,
+    plot_event_metric_bars,
+    plot_eeg_expert_prediction_panel,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -377,6 +384,43 @@ class Exp_PointSeg(Exp_Basic):
 
         return dict(tp=tp_all, fp=fp_all, fn=fn_all, precision=precision, recall=recall, f1=f1)
 
+    def _extract_postprocessed_sequences(self, batch_x, outputs, label, mask):
+        """
+        提取每个样本的局部 EEG、真值点序列和后处理后的预测点序列（仅保留有效点）。
+        """
+        probs = torch.softmax(outputs, dim=-1)[..., 1]  # [B, T]
+        point_preds = (probs >= float(getattr(self.args, "pos_threshold", 0.2))).detach().cpu().numpy().astype(np.int64)
+        label_np = label.detach().cpu().numpy().astype(np.int64)
+        mask_np = mask.detach().cpu().numpy().astype(np.int64)
+        x_np = batch_x.detach().cpu().numpy().astype(np.float32)  # [B, T, C]
+
+        fs = float(getattr(self.args, "fs", 256.0))
+        min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+
+        out = []
+        B = point_preds.shape[0]
+        for b in range(B):
+            valid = mask_np[b] > 0
+            pred_seq = point_preds[b][valid]
+            true_seq = label_np[b][valid]
+            eeg_seq = x_np[b][valid, 0] if x_np.shape[-1] > 0 else x_np[b][valid]
+            pred_events = self._postprocess_spindle_events(
+                pred_seq,
+                np.ones_like(pred_seq, dtype=np.int64),
+                fs=fs,
+                merge_gap_sec=merge_gap,
+                min_dur_sec=min_dur,
+                max_dur_sec=999.0,
+            )
+            pred_post = self._events_to_point_preds(pred_events, np.ones_like(pred_seq, dtype=np.int64))
+            tp, fp, fn = self._event_match_one_to_one(pred_events, self._binary_to_events(true_seq))
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            out.append(dict(eeg=eeg_seq, true=true_seq, pred=pred_post, event_f1=f1))
+        return out
+
     def _postprocess_spindle_events(
         self,
         point_preds_1d: np.ndarray,
@@ -608,6 +652,16 @@ class Exp_PointSeg(Exp_Basic):
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
+        history = {
+            "epoch": [],
+            "train_loss": [],
+            "val_loss": [],
+            "val_point_f1": [],
+            "val_event_f1": [],
+            "val_event_precision": [],
+            "val_event_recall": [],
+            "val_point_acc": [],
+        }
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -686,8 +740,21 @@ class Exp_PointSeg(Exp_Basic):
                 print("Early stopping")
                 break
 
+            history["epoch"].append(epoch + 1)
+            history["train_loss"].append(float(train_loss))
+            history["val_loss"].append(float(vali_loss))
+            history["val_point_f1"].append(float(val_point_metrics["f1"]))
+            history["val_event_f1"].append(float(val_event_metrics["f1"]))
+            history["val_event_precision"].append(float(val_event_metrics["precision"]))
+            history["val_event_recall"].append(float(val_event_metrics["recall"]))
+            history["val_point_acc"].append(float(val_point_metrics["acc"]))
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
+
+        plot_dir = os.path.join("./results", setting, "plots")
+        plot_training_curves(history, plot_dir)
+        self.train_history = history
 
         return self.model
 
@@ -703,6 +770,7 @@ class Exp_PointSeg(Exp_Basic):
         event_tp = 0
         event_fp = 0
         event_fn = 0
+        sample_cases = []
 
         self.model.eval()
         criterion = self._select_criterion()
@@ -722,6 +790,7 @@ class Exp_PointSeg(Exp_Basic):
                 event_tp += evt["tp"]
                 event_fp += evt["fp"]
                 event_fn += evt["fn"]
+                sample_cases.extend(self._extract_postprocessed_sequences(batch_x, outputs, label, padding_mask))
 
                 if preds_flat.numel() > 0:
                     all_preds.append(preds_flat.detach().cpu())
@@ -774,4 +843,59 @@ class Exp_PointSeg(Exp_Basic):
         )
         f.write('\n\n')
         f.close()
+
+        plot_dir = os.path.join("./results", setting, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        if all_preds:
+            y_pred = torch.cat(all_preds, dim=0).numpy()
+            y_true = torch.cat(all_trues, dim=0).numpy()
+            plot_point_confusion_matrix(y_true, y_pred, os.path.join(plot_dir, "point_confusion_matrix.png"))
+        plot_point_vs_event_metrics(point_metrics, event_metrics, os.path.join(plot_dir, "point_vs_event_metrics.png"))
+        plot_event_metric_bars(event_metrics, os.path.join(plot_dir, "event_metrics_bar.png"))
+
+        # EEG 可视化：成功 / 边界差异 / 失败
+        fs = float(getattr(self.args, "fs", 256.0))
+        success_case = next((c for c in sample_cases if c["event_f1"] >= 0.8), None)
+        boundary_case = next((c for c in sample_cases if 0.2 < c["event_f1"] < 0.8), None)
+        fail_case = next((c for c in sample_cases if c["event_f1"] <= 0.2), None)
+
+        def _pick_10_20s(arr_eeg, arr_true, arr_pred):
+            T = len(arr_eeg)
+            min_len = int(round(10 * fs))
+            max_len = int(round(20 * fs))
+            seg_len = min(T, max(min_len, min(max_len, T)))
+            if seg_len >= T:
+                return arr_eeg, arr_true, arr_pred
+            center = T // 2
+            start = max(0, center - seg_len // 2)
+            end = start + seg_len
+            return arr_eeg[start:end], arr_true[start:end], arr_pred[start:end]
+
+        if success_case is not None:
+            eeg, y, p = _pick_10_20s(success_case["eeg"], success_case["true"], success_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_success_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Success case",
+            )
+        if boundary_case is not None:
+            eeg, y, p = _pick_10_20s(boundary_case["eeg"], boundary_case["true"], boundary_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_boundary_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Boundary-difference case",
+            )
+        if fail_case is not None:
+            eeg, y, p = _pick_10_20s(fail_case["eeg"], fail_case["true"], fail_case["pred"])
+            plot_eeg_expert_prediction_panel(
+                eeg, y, p,
+                save_path=os.path.join(plot_dir, "eeg_failure_case.png"),
+                fs=fs,
+                expert1=y,
+                title="Failure case",
+            )
         return
