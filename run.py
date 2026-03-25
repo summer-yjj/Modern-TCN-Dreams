@@ -108,13 +108,13 @@ parser.add_argument('--focal_gamma', type=float, default=2.0,
                     help='gamma for focal loss (point segmentation)')
 parser.add_argument('--dice_weight', type=float, default=1.0,
                     help='dice term weight when using focal_dice loss (point segmentation)')
-parser.add_argument('--pointseg_balanced_sampling', type=str2bool, default=True,
+parser.add_argument('--pointseg_balanced_sampling', type=str2bool, default=False,
                     help='use weighted sampling to increase positive windows in point segmentation training')
 parser.add_argument('--pointseg_target_pos_ratio', type=float, default=0.5,
                     help='target positive-window ratio for weighted sampling in point segmentation training')
-parser.add_argument('--pointseg_pos_jitter_std', type=float, default=0.02,
+parser.add_argument('--pointseg_pos_jitter_std', type=float, default=0.0,
                     help='std of gaussian jitter for positive windows (point segmentation)')
-parser.add_argument('--pointseg_pos_jitter_prob', type=float, default=0.5,
+parser.add_argument('--pointseg_pos_jitter_prob', type=float, default=0.0,
                     help='probability of applying jitter augmentation to each positive window')
 parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
 parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
@@ -141,8 +141,14 @@ parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior ano
 parser.add_argument('--class_dropout', type=float, default=0.05, help='classfication dropout')
 
 # point segmentation task
-parser.add_argument('--pos_threshold', type=float, default=0.5, help='threshold for positive class in point segmentation')
+parser.add_argument('--pos_threshold', type=float, default=0.2, help='threshold for positive class in point segmentation')
 parser.add_argument('--pos_weight', type=float, default=-1.0, help='manual positive class weight for point segmentation; <0 means auto')
+parser.add_argument('--event_min_duration_sec', type=float, default=0.5,
+                    help='minimum duration (seconds) for predicted spindle events')
+parser.add_argument('--event_merge_gap_sec', type=float, default=0.15,
+                    help='merge adjacent predicted events if their gap is below this (seconds)')
+parser.add_argument('--event_one_to_one', type=str2bool, default=True,
+                    help='use one-to-one overlap matching for event-level metrics')
 
 args = parser.parse_args()
 

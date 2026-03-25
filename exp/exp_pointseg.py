@@ -265,6 +265,118 @@ class Exp_PointSeg(Exp_Basic):
             f1 = 0.0
         return dict(acc=float(acc), precision=float(precision), recall=float(recall), f1=float(f1))
 
+    def _binary_to_events(self, binary_1d: np.ndarray):
+        """
+        把 0/1 序列转换为闭区间事件列表 [(start, end), ...]。
+        """
+        if binary_1d.size == 0:
+            return []
+        arr = binary_1d.astype(int)
+        events = []
+        in_evt = False
+        s = 0
+        for i, v in enumerate(arr):
+            if v == 1 and not in_evt:
+                in_evt = True
+                s = i
+            elif v == 0 and in_evt:
+                in_evt = False
+                events.append((s, i - 1))
+        if in_evt:
+            events.append((s, len(arr) - 1))
+        return events
+
+    def _overlap(self, e1, e2):
+        s1, t1 = e1
+        s2, t2 = e2
+        left = max(s1, s2)
+        right = min(t1, t2)
+        return max(0, right - left + 1)
+
+    def _event_match_one_to_one(self, pred_events, true_events):
+        """
+        一对一重叠匹配：每个预测事件最多匹配一个真实事件，反之亦然。
+        判定匹配条件：事件有重叠（overlap > 0）。
+        """
+        matched_true = set()
+        tp = 0
+        for pe in pred_events:
+            best_j = -1
+            best_ov = 0
+            for j, te in enumerate(true_events):
+                if j in matched_true:
+                    continue
+                ov = self._overlap(pe, te)
+                if ov > best_ov:
+                    best_ov = ov
+                    best_j = j
+            if best_j >= 0 and best_ov > 0:
+                tp += 1
+                matched_true.add(best_j)
+        fp = max(0, len(pred_events) - tp)
+        fn = max(0, len(true_events) - tp)
+        return tp, fp, fn
+
+    def _event_level_metrics_from_batch(self, outputs, label, mask):
+        """
+        事件级评估：
+        1) 概率阈值二值化
+        2) 候选事件提取
+        3) 先去除过短事件，再合并间隔过近事件
+        4) 一对一重叠匹配计算 TP/FP/FN
+        """
+        probs = torch.softmax(outputs, dim=-1)[..., 1]  # [B, T]
+        pred_bin = (probs >= float(getattr(self.args, "pos_threshold", 0.2))).detach().cpu().numpy().astype(np.int64)
+        true_bin = label.detach().cpu().numpy().astype(np.int64)
+        mask_np = mask.detach().cpu().numpy().astype(np.int64)
+
+        fs = float(getattr(self.args, "fs", 256.0))
+        min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        one_to_one = bool(getattr(self.args, "event_one_to_one", True))
+
+        tp_all, fp_all, fn_all = 0, 0, 0
+        B = pred_bin.shape[0]
+        for b in range(B):
+            valid = mask_np[b] > 0
+            pred_seq = pred_bin[b][valid]
+            true_seq = true_bin[b][valid]
+
+            pred_events = self._postprocess_spindle_events(
+                pred_seq,
+                np.ones_like(pred_seq, dtype=np.int64),
+                fs=fs,
+                merge_gap_sec=merge_gap,
+                min_dur_sec=min_dur,
+                max_dur_sec=999.0,
+            )
+            true_events = self._binary_to_events(true_seq)
+
+            if one_to_one:
+                tp, fp, fn = self._event_match_one_to_one(pred_events, true_events)
+            else:
+                # 兜底：非一对一时仍以重叠命中为 TP（较宽松）
+                tp = 0
+                used_true = set()
+                for pe in pred_events:
+                    for j, te in enumerate(true_events):
+                        if self._overlap(pe, te) > 0:
+                            tp += 1
+                            used_true.add(j)
+                            break
+                fp = max(0, len(pred_events) - tp)
+                fn = max(0, len(true_events) - len(used_true))
+
+            tp_all += tp
+            fp_all += fp
+            fn_all += fn
+
+        precision = tp_all / (tp_all + fp_all) if (tp_all + fp_all) > 0 else 0.0
+        recall = tp_all / (tp_all + fn_all) if (tp_all + fn_all) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return dict(tp=tp_all, fp=fp_all, fn=fn_all, precision=precision, recall=recall, f1=f1)
+
     def _postprocess_spindle_events(
         self,
         point_preds_1d: np.ndarray,
@@ -436,6 +548,9 @@ class Exp_PointSeg(Exp_Basic):
         total_loss = []
         all_preds = []
         all_trues = []
+        event_tp = 0
+        event_fp = 0
+        event_fn = 0
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, label, padding_mask) in enumerate(vali_loader):
@@ -449,6 +564,10 @@ class Exp_PointSeg(Exp_Basic):
                     outputs, label, padding_mask, criterion
                 )
                 total_loss.append(loss.item())
+                evt = self._event_level_metrics_from_batch(outputs, label, padding_mask)
+                event_tp += evt["tp"]
+                event_fp += evt["fp"]
+                event_fn += evt["fn"]
 
                 if preds_flat.numel() > 0:
                     all_preds.append(preds_flat.detach().cpu())
@@ -459,12 +578,18 @@ class Exp_PointSeg(Exp_Basic):
         if all_preds:
             preds_cat = torch.cat(all_preds, dim=0).numpy()
             trues_cat = torch.cat(all_trues, dim=0).numpy()
-            metrics = self._pointwise_metrics(preds_cat, trues_cat)
+            point_metrics = self._pointwise_metrics(preds_cat, trues_cat)
         else:
-            metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+            point_metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+
+        event_precision = event_tp / (event_tp + event_fp) if (event_tp + event_fp) > 0 else 0.0
+        event_recall = event_tp / (event_tp + event_fn) if (event_tp + event_fn) > 0 else 0.0
+        event_f1 = 2 * event_precision * event_recall / (event_precision + event_recall) if (event_precision + event_recall) > 0 else 0.0
+        event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
+                             precision=event_precision, recall=event_recall, f1=event_f1)
 
         self.model.train()
-        return total_loss, metrics
+        return total_loss, point_metrics, event_metrics
 
     def train(self, setting):
         # 直接使用预先划分好的 TRAIN / VAL 窗口
@@ -539,24 +664,24 @@ class Exp_PointSeg(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss) if train_loss else 0.0
-            vali_loss, val_metrics = self.vali(vali_loader, criterion)
+            vali_loss, val_point_metrics, val_event_metrics = self.vali(vali_loader, criterion)
 
             print(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} "
-                "Vali Loss: {3:.3f} Vali Acc: {4:.3f} Vali Prec: {5:.3f} "
-                "Vali Rec: {6:.3f} Vali F1: {7:.3f}".format(
+                "Vali Loss: {3:.3f} | Point F1: {4:.3f} | Event Prec: {5:.3f} "
+                "Event Rec: {6:.3f} Event F1: {7:.3f}".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
                     vali_loss,
-                    val_metrics["acc"],
-                    val_metrics["precision"],
-                    val_metrics["recall"],
-                    val_metrics["f1"],
+                    val_point_metrics["f1"],
+                    val_event_metrics["precision"],
+                    val_event_metrics["recall"],
+                    val_event_metrics["f1"],
                 )
             )
-            # 逐点分割任务建议盯 F1 做早停
-            early_stopping(-val_metrics["f1"], self.model, path)
+            # 默认基线：事件级 F1 作为核心早停指标
+            early_stopping(-val_event_metrics["f1"], self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
@@ -575,6 +700,9 @@ class Exp_PointSeg(Exp_Basic):
         total_loss = []
         all_preds = []
         all_trues = []
+        event_tp = 0
+        event_fp = 0
+        event_fn = 0
 
         self.model.eval()
         criterion = self._select_criterion()
@@ -590,6 +718,10 @@ class Exp_PointSeg(Exp_Basic):
                     outputs, label, padding_mask, criterion
                 )
                 total_loss.append(loss.item())
+                evt = self._event_level_metrics_from_batch(outputs, label, padding_mask)
+                event_tp += evt["tp"]
+                event_fp += evt["fp"]
+                event_fn += evt["fn"]
 
                 if preds_flat.numel() > 0:
                     all_preds.append(preds_flat.detach().cpu())
@@ -600,13 +732,23 @@ class Exp_PointSeg(Exp_Basic):
         if all_preds:
             preds_cat = torch.cat(all_preds, dim=0).numpy()
             trues_cat = torch.cat(all_trues, dim=0).numpy()
-            metrics = self._pointwise_metrics(preds_cat, trues_cat)
+            point_metrics = self._pointwise_metrics(preds_cat, trues_cat)
         else:
-            metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+            point_metrics = dict(acc=0.0, precision=0.0, recall=0.0, f1=0.0)
+
+        event_precision = event_tp / (event_tp + event_fp) if (event_tp + event_fp) > 0 else 0.0
+        event_recall = event_tp / (event_tp + event_fn) if (event_tp + event_fn) > 0 else 0.0
+        event_f1 = 2 * event_precision * event_recall / (event_precision + event_recall) if (event_precision + event_recall) > 0 else 0.0
+        event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
+                             precision=event_precision, recall=event_recall, f1=event_f1)
 
         print(
             "test point-wise metrics: "
-            "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**metrics)
+            "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**point_metrics)
+        )
+        print(
+            "test event-level metrics (one-to-one overlap): "
+            "TP={tp}, FP={fp}, FN={fn}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**event_metrics)
         )
 
         # result save
@@ -620,7 +762,14 @@ class Exp_PointSeg(Exp_Basic):
         f.write('\n')
         f.write(
             'point_acc:{:.6f}, point_prec:{:.6f}, point_rec:{:.6f}, point_f1:{:.6f}'.format(
-                metrics["acc"], metrics["precision"], metrics["recall"], metrics["f1"]
+                point_metrics["acc"], point_metrics["precision"], point_metrics["recall"], point_metrics["f1"]
+            )
+        )
+        f.write('\n')
+        f.write(
+            'event_tp:{}, event_fp:{}, event_fn:{}, event_prec:{:.6f}, event_rec:{:.6f}, event_f1:{:.6f}'.format(
+                event_metrics["tp"], event_metrics["fp"], event_metrics["fn"],
+                event_metrics["precision"], event_metrics["recall"], event_metrics["f1"]
             )
         )
         f.write('\n\n')
