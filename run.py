@@ -147,6 +147,8 @@ parser.add_argument('--event_min_duration_sec', type=float, default=0.5,
                     help='minimum duration (seconds) for predicted spindle events')
 parser.add_argument('--event_merge_gap_sec', type=float, default=0.15,
                     help='merge adjacent predicted events if their gap is below this (seconds)')
+parser.add_argument('--event_max_duration_sec', type=float, default=3.0,
+                    help='maximum duration (seconds) for predicted spindle events')
 parser.add_argument('--event_one_to_one', type=str2bool, default=True,
                     help='use one-to-one overlap matching for event-level metrics')
 

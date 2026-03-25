@@ -340,6 +340,7 @@ class Exp_PointSeg(Exp_Basic):
         fs = float(getattr(self.args, "fs", 256.0))
         min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
         merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        max_dur = float(getattr(self.args, "event_max_duration_sec", 3.0))
         one_to_one = bool(getattr(self.args, "event_one_to_one", True))
 
         tp_all, fp_all, fn_all = 0, 0, 0
@@ -355,7 +356,7 @@ class Exp_PointSeg(Exp_Basic):
                 fs=fs,
                 merge_gap_sec=merge_gap,
                 min_dur_sec=min_dur,
-                max_dur_sec=999.0,
+                max_dur_sec=max_dur,
             )
             true_events = self._binary_to_events(true_seq)
 
@@ -397,6 +398,7 @@ class Exp_PointSeg(Exp_Basic):
         fs = float(getattr(self.args, "fs", 256.0))
         min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
         merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        max_dur = float(getattr(self.args, "event_max_duration_sec", 3.0))
 
         out = []
         B = point_preds.shape[0]
@@ -411,7 +413,7 @@ class Exp_PointSeg(Exp_Basic):
                 fs=fs,
                 merge_gap_sec=merge_gap,
                 min_dur_sec=min_dur,
-                max_dur_sec=999.0,
+                max_dur_sec=max_dur,
             )
             pred_post = self._events_to_point_preds(pred_events, np.ones_like(pred_seq, dtype=np.int64))
             tp, fp, fn = self._event_match_one_to_one(pred_events, self._binary_to_events(true_seq))
@@ -472,13 +474,19 @@ class Exp_PointSeg(Exp_Basic):
             return []
 
         # 合并间隔 <= merge_gap_sec 的相邻事件
+        # 新增约束：仅当“合并后总时长 <= max_dur_sec”时才执行合并
         gap_max = int(np.floor(merge_gap_sec * fs))
         merged = []
         cur_start, cur_end = events[0]
         for s, e in events[1:]:
             gap = s - cur_end - 1
             if gap <= gap_max:
-                cur_end = e
+                merged_len_sec = (e - cur_start + 1) / fs
+                if merged_len_sec <= max_dur_sec:
+                    cur_end = e
+                else:
+                    merged.append((cur_start, cur_end))
+                    cur_start, cur_end = s, e
             else:
                 merged.append((cur_start, cur_end))
                 cur_start, cur_end = s, e
@@ -547,10 +555,10 @@ class Exp_PointSeg(Exp_Basic):
         label_np = label.detach().cpu().numpy().astype(np.int64)                         # [B, T]
         mask_np = mask.detach().cpu().numpy().astype(np.int64)                           # [B, T]
 
-        fs = getattr(self.args, "fs", 256.0)
-        merge_gap_sec = 0.2
-        min_dur_sec = 0.5
-        max_dur_sec = 3.0
+        fs = float(getattr(self.args, "fs", 256.0))
+        merge_gap_sec = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        min_dur_sec = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        max_dur_sec = float(getattr(self.args, "event_max_duration_sec", 3.0))
 
         all_preds_list = []
         all_labels_list = []
