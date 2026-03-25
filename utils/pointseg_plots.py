@@ -164,12 +164,20 @@ def plot_eeg_expert_prediction_panel(
     fig, axes = plt.subplots(4, 1, figsize=(12, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1, 1, 1]})
 
     # 1) EEG
-    axes[0].plot(t, eeg, color="black", linewidth=0.8)
-    pred_mask = pd > 0
-    eeg_highlight = np.where(pred_mask, eeg, np.nan)
-    axes[0].plot(t, eeg_highlight, color="#d62728", linewidth=1.2, label="Prediction highlight")
+    axes[0].plot(t, eeg, color="black", linewidth=0.8, label="EEG")
+    # 精细边界高亮：只在预测事件边界内将波形标红，并绘制边界线
+    pred_events = _binary_events(pd)
+    for s, e in pred_events:
+        s = max(0, int(s))
+        e = min(T - 1, int(e))
+        if e < s:
+            continue
+        axes[0].plot(t[s:e + 1], eeg[s:e + 1], color="#d62728", linewidth=1.4)
+        axes[0].axvspan(t[s], t[e], color="#d62728", alpha=0.12)
+        axes[0].axvline(t[s], color="#d62728", linestyle="--", linewidth=0.8, alpha=0.9)
+        axes[0].axvline(t[e], color="#d62728", linestyle="--", linewidth=0.8, alpha=0.9)
     axes[0].set_ylabel("EEG")
-    axes[0].legend(loc="upper right")
+    axes[0].legend(["EEG", "Predicted spindle segment"], loc="upper right")
     axes[0].set_title(title if title else "EEG + Expert1 + Expert2 + Prediction")
 
     def draw_event_row(ax, binary, label, color):
