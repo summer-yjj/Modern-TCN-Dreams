@@ -8,6 +8,7 @@ from torch import optim
 import os
 import time
 import warnings
+import csv
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from utils.pointseg_plots import (
@@ -121,6 +122,23 @@ class Exp_PointSeg(Exp_Basic):
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
+    def _resolve_log_path(self, setting=None):
+        if setting is not None:
+            base_dir = os.path.join("./results", setting)
+            os.makedirs(base_dir, exist_ok=True)
+            return os.path.join(base_dir, "run_output.log")
+        base_dir = os.path.join("./results", "_bootstrap_logs")
+        os.makedirs(base_dir, exist_ok=True)
+        model_id = getattr(self.args, "model_id", "exp_pointseg")
+        return os.path.join(base_dir, f"{model_id}.log")
+
+    def _log(self, message, setting=None):
+        text = str(message)
+        print(text)
+        log_path = self._resolve_log_path(setting=setting)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
@@ -163,7 +181,7 @@ class Exp_PointSeg(Exp_Basic):
             replacement=True,
         )
 
-        print(
+        self._log(
             f"[Exp_PointSeg] balanced sampler enabled: "
             f"windows total={n_total}, pos={n_pos}, neg={n_neg}, "
             f"raw_pos_ratio={n_pos / n_total:.4f}, target_pos_ratio={target_pos_ratio:.4f}"
@@ -219,7 +237,7 @@ class Exp_PointSeg(Exp_Basic):
         w0 = total / (2.0 * count0) if count0 > 0 else 1.0
         w1 = total / (2.0 * count1)
         class_weights = np.array([w0, w1], dtype=np.float32)
-        print(f"[Exp_PointSeg] class weights (0->1): {class_weights}")
+        self._log(f"[Exp_PointSeg] class weights (0->1): {class_weights}")
         return class_weights
 
     def _pointwise_loss_and_preds(self, outputs, label, mask, criterion):
@@ -340,6 +358,7 @@ class Exp_PointSeg(Exp_Basic):
         fs = float(getattr(self.args, "fs", 256.0))
         min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
         merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        max_dur = float(getattr(self.args, "event_max_duration_sec", 3.0))
         one_to_one = bool(getattr(self.args, "event_one_to_one", True))
 
         tp_all, fp_all, fn_all = 0, 0, 0
@@ -355,7 +374,7 @@ class Exp_PointSeg(Exp_Basic):
                 fs=fs,
                 merge_gap_sec=merge_gap,
                 min_dur_sec=min_dur,
-                max_dur_sec=999.0,
+                max_dur_sec=max_dur,
             )
             true_events = self._binary_to_events(true_seq)
 
@@ -397,6 +416,7 @@ class Exp_PointSeg(Exp_Basic):
         fs = float(getattr(self.args, "fs", 256.0))
         min_dur = float(getattr(self.args, "event_min_duration_sec", 0.5))
         merge_gap = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        max_dur = float(getattr(self.args, "event_max_duration_sec", 3.0))
 
         out = []
         B = point_preds.shape[0]
@@ -411,7 +431,7 @@ class Exp_PointSeg(Exp_Basic):
                 fs=fs,
                 merge_gap_sec=merge_gap,
                 min_dur_sec=min_dur,
-                max_dur_sec=999.0,
+                max_dur_sec=max_dur,
             )
             pred_post = self._events_to_point_preds(pred_events, np.ones_like(pred_seq, dtype=np.int64))
             tp, fp, fn = self._event_match_one_to_one(pred_events, self._binary_to_events(true_seq))
@@ -472,13 +492,19 @@ class Exp_PointSeg(Exp_Basic):
             return []
 
         # 合并间隔 <= merge_gap_sec 的相邻事件
+        # 新增约束：仅当“合并后总时长 <= max_dur_sec”时才执行合并
         gap_max = int(np.floor(merge_gap_sec * fs))
         merged = []
         cur_start, cur_end = events[0]
         for s, e in events[1:]:
             gap = s - cur_end - 1
             if gap <= gap_max:
-                cur_end = e
+                merged_len_sec = (e - cur_start + 1) / fs
+                if merged_len_sec <= max_dur_sec:
+                    cur_end = e
+                else:
+                    merged.append((cur_start, cur_end))
+                    cur_start, cur_end = s, e
             else:
                 merged.append((cur_start, cur_end))
                 cur_start, cur_end = s, e
@@ -547,10 +573,10 @@ class Exp_PointSeg(Exp_Basic):
         label_np = label.detach().cpu().numpy().astype(np.int64)                         # [B, T]
         mask_np = mask.detach().cpu().numpy().astype(np.int64)                           # [B, T]
 
-        fs = getattr(self.args, "fs", 256.0)
-        merge_gap_sec = 0.2
-        min_dur_sec = 0.5
-        max_dur_sec = 3.0
+        fs = float(getattr(self.args, "fs", 256.0))
+        merge_gap_sec = float(getattr(self.args, "event_merge_gap_sec", 0.15))
+        min_dur_sec = float(getattr(self.args, "event_min_duration_sec", 0.5))
+        max_dur_sec = float(getattr(self.args, "event_max_duration_sec", 3.0))
 
         all_preds_list = []
         all_labels_list = []
@@ -587,6 +613,42 @@ class Exp_PointSeg(Exp_Basic):
         labels_valid = torch.from_numpy(labels_valid_np).long().to(outputs.device)
 
         return loss, preds_valid, labels_valid
+
+    def _save_history_csv(self, history: dict, save_path: str):
+        """
+        将每轮训练/验证指标保存为 CSV 表格，便于后续统计与可视化。
+        """
+        keys = ["epoch", "train_loss", "val_loss", "val_point_f1", "val_event_precision", "val_event_recall", "val_event_f1", "val_point_acc"]
+        rows = list(zip(*[history.get(k, []) for k in keys])) if history.get("epoch", []) else []
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(keys)
+            writer.writerows(rows)
+
+    def _save_test_metrics_csv(self, point_metrics: dict, event_metrics: dict, save_path: str):
+        """
+        将测试集最终 point/event 指标保存为 CSV（一行）。
+        """
+        keys = [
+            "point_acc", "point_precision", "point_recall", "point_f1",
+            "event_tp", "event_fp", "event_fn", "event_precision", "event_recall", "event_f1",
+        ]
+        row = [
+            float(point_metrics.get("acc", 0.0)),
+            float(point_metrics.get("precision", 0.0)),
+            float(point_metrics.get("recall", 0.0)),
+            float(point_metrics.get("f1", 0.0)),
+            int(event_metrics.get("tp", 0)),
+            int(event_metrics.get("fp", 0)),
+            int(event_metrics.get("fn", 0)),
+            float(event_metrics.get("precision", 0.0)),
+            float(event_metrics.get("recall", 0.0)),
+            float(event_metrics.get("f1", 0.0)),
+        ]
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(keys)
+            writer.writerow(row)
 
     def vali(self, vali_loader, criterion):
         total_loss = []
@@ -694,10 +756,10 @@ class Exp_PointSeg(Exp_Basic):
 
                 # 只在第一个 epoch 的第一个 batch 打印一次形状，确认数据流是否正确
                 if epoch == 0 and i == 0:
-                    print("batch_x:", batch_x.shape)
-                    print("label:", label.shape)
-                    print("padding_mask:", padding_mask.shape)
-                    print("outputs:", outputs.shape)
+                    self._log(f"batch_x: {batch_x.shape}", setting=setting)
+                    self._log(f"label: {label.shape}", setting=setting)
+                    self._log(f"padding_mask: {padding_mask.shape}", setting=setting)
+                    self._log(f"outputs: {outputs.shape}", setting=setting)
 
                 loss, _, _ = self._pointwise_loss_and_preds(
                     outputs, label, padding_mask, criterion
@@ -705,10 +767,10 @@ class Exp_PointSeg(Exp_Basic):
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    self._log("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()), setting=setting)
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    self._log('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time), setting=setting)
                     iter_count = 0
                     time_now = time.time()
 
@@ -716,11 +778,11 @@ class Exp_PointSeg(Exp_Basic):
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
                 model_optim.step()
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            self._log("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time), setting=setting)
             train_loss = np.average(train_loss) if train_loss else 0.0
             vali_loss, val_point_metrics, val_event_metrics = self.vali(vali_loader, criterion)
 
-            print(
+            self._log(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} "
                 "Vali Loss: {3:.3f} | Point F1: {4:.3f} | Event Prec: {5:.3f} "
                 "Event Rec: {6:.3f} Event F1: {7:.3f}".format(
@@ -734,12 +796,6 @@ class Exp_PointSeg(Exp_Basic):
                     val_event_metrics["f1"],
                 )
             )
-            # 默认基线：事件级 F1 作为核心早停指标
-            early_stopping(-val_event_metrics["f1"], self.model, path)
-            if early_stopping.early_stop:
-                print("Early stopping")
-                break
-
             history["epoch"].append(epoch + 1)
             history["train_loss"].append(float(train_loss))
             history["val_loss"].append(float(vali_loss))
@@ -749,11 +805,19 @@ class Exp_PointSeg(Exp_Basic):
             history["val_event_recall"].append(float(val_event_metrics["recall"]))
             history["val_point_acc"].append(float(val_point_metrics["acc"]))
 
+            # 默认基线：事件级 F1 作为核心早停指标
+            early_stopping(-val_event_metrics["f1"], self.model, path)
+            if early_stopping.early_stop:
+                self._log("Early stopping", setting=setting)
+                break
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
         plot_dir = os.path.join("./results", setting, "plots")
         plot_training_curves(history, plot_dir)
+        os.makedirs(os.path.join("./results", setting), exist_ok=True)
+        self._save_history_csv(history, os.path.join("./results", setting, "epoch_metrics.csv"))
         self.train_history = history
 
         return self.model
@@ -761,7 +825,7 @@ class Exp_PointSeg(Exp_Basic):
     def test(self, setting, test=0):
         _, test_loader = self._get_data(flag='TEST')
         if test:
-            print('loading model')
+            self._log('loading model', setting=setting)
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
 
         total_loss = []
@@ -811,14 +875,14 @@ class Exp_PointSeg(Exp_Basic):
         event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
                              precision=event_precision, recall=event_recall, f1=event_f1)
 
-        print(
+        self._log(
             "test point-wise metrics: "
             "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**point_metrics)
-        )
-        print(
+        , setting=setting)
+        self._log(
             "test event-level metrics (one-to-one overlap): "
             "TP={tp}, FP={fp}, FN={fn}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**event_metrics)
-        )
+        , setting=setting)
 
         # result save
         folder_path = './results/' + setting + '/'
@@ -846,6 +910,7 @@ class Exp_PointSeg(Exp_Basic):
 
         plot_dir = os.path.join("./results", setting, "plots")
         os.makedirs(plot_dir, exist_ok=True)
+        self._save_test_metrics_csv(point_metrics, event_metrics, os.path.join("./results", setting, "test_metrics.csv"))
         if all_preds:
             y_pred = torch.cat(all_preds, dim=0).numpy()
             y_true = torch.cat(all_trues, dim=0).numpy()
