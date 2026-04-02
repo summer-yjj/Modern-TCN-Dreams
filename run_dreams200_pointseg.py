@@ -85,6 +85,8 @@ def build_parser():
     parser.add_argument("--stem_ratio", type=int, default=6)
     parser.add_argument("--kernel_size", type=int, default=25)
     parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--individual", type=int, default=0)
+    parser.add_argument("--decomposition", type=int, default=0)
     parser.add_argument("--use_gpu_ids", type=str, default="")
     parser.add_argument("--features", type=str, default="M")
     parser.add_argument("--freq", type=str, default="h")
