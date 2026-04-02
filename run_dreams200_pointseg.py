@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 
-from exp.exp_pointseg_dreams200 import Exp_PointSeg_Dreams200
+from exp.exp_pointseg_dreams200hz import Exp_PointSeg_Dreams200Hz
 from utils.str2bool import str2bool
 
 
@@ -115,7 +115,7 @@ def main():
     print("Args in experiment:")
     print(args)
 
-    Exp = Exp_PointSeg_Dreams200
+    Exp = Exp_PointSeg_Dreams200Hz
     for ii in range(args.itr):
         setting = (
             f"{args.model_id}_{args.model}_{args.data}_"

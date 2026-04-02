@@ -122,6 +122,23 @@ class Exp_PointSeg(Exp_Basic):
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
+    def _resolve_log_path(self, setting=None):
+        if setting is not None:
+            base_dir = os.path.join("./results", setting)
+            os.makedirs(base_dir, exist_ok=True)
+            return os.path.join(base_dir, "run_output.log")
+        base_dir = os.path.join("./results", "_bootstrap_logs")
+        os.makedirs(base_dir, exist_ok=True)
+        model_id = getattr(self.args, "model_id", "exp_pointseg")
+        return os.path.join(base_dir, f"{model_id}.log")
+
+    def _log(self, message, setting=None):
+        text = str(message)
+        print(text)
+        log_path = self._resolve_log_path(setting=setting)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
@@ -164,7 +181,7 @@ class Exp_PointSeg(Exp_Basic):
             replacement=True,
         )
 
-        print(
+        self._log(
             f"[Exp_PointSeg] balanced sampler enabled: "
             f"windows total={n_total}, pos={n_pos}, neg={n_neg}, "
             f"raw_pos_ratio={n_pos / n_total:.4f}, target_pos_ratio={target_pos_ratio:.4f}"
@@ -220,7 +237,7 @@ class Exp_PointSeg(Exp_Basic):
         w0 = total / (2.0 * count0) if count0 > 0 else 1.0
         w1 = total / (2.0 * count1)
         class_weights = np.array([w0, w1], dtype=np.float32)
-        print(f"[Exp_PointSeg] class weights (0->1): {class_weights}")
+        self._log(f"[Exp_PointSeg] class weights (0->1): {class_weights}")
         return class_weights
 
     def _pointwise_loss_and_preds(self, outputs, label, mask, criterion):
@@ -739,10 +756,10 @@ class Exp_PointSeg(Exp_Basic):
 
                 # 只在第一个 epoch 的第一个 batch 打印一次形状，确认数据流是否正确
                 if epoch == 0 and i == 0:
-                    print("batch_x:", batch_x.shape)
-                    print("label:", label.shape)
-                    print("padding_mask:", padding_mask.shape)
-                    print("outputs:", outputs.shape)
+                    self._log(f"batch_x: {batch_x.shape}", setting=setting)
+                    self._log(f"label: {label.shape}", setting=setting)
+                    self._log(f"padding_mask: {padding_mask.shape}", setting=setting)
+                    self._log(f"outputs: {outputs.shape}", setting=setting)
 
                 loss, _, _ = self._pointwise_loss_and_preds(
                     outputs, label, padding_mask, criterion
@@ -750,10 +767,10 @@ class Exp_PointSeg(Exp_Basic):
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    self._log("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()), setting=setting)
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    self._log('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time), setting=setting)
                     iter_count = 0
                     time_now = time.time()
 
@@ -761,11 +778,11 @@ class Exp_PointSeg(Exp_Basic):
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
                 model_optim.step()
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            self._log("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time), setting=setting)
             train_loss = np.average(train_loss) if train_loss else 0.0
             vali_loss, val_point_metrics, val_event_metrics = self.vali(vali_loader, criterion)
 
-            print(
+            self._log(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.3f} "
                 "Vali Loss: {3:.3f} | Point F1: {4:.3f} | Event Prec: {5:.3f} "
                 "Event Rec: {6:.3f} Event F1: {7:.3f}".format(
@@ -791,7 +808,7 @@ class Exp_PointSeg(Exp_Basic):
             # 默认基线：事件级 F1 作为核心早停指标
             early_stopping(-val_event_metrics["f1"], self.model, path)
             if early_stopping.early_stop:
-                print("Early stopping")
+                self._log("Early stopping", setting=setting)
                 break
 
         best_model_path = path + '/' + 'checkpoint.pth'
@@ -808,7 +825,7 @@ class Exp_PointSeg(Exp_Basic):
     def test(self, setting, test=0):
         _, test_loader = self._get_data(flag='TEST')
         if test:
-            print('loading model')
+            self._log('loading model', setting=setting)
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
 
         total_loss = []
@@ -858,14 +875,14 @@ class Exp_PointSeg(Exp_Basic):
         event_metrics = dict(tp=event_tp, fp=event_fp, fn=event_fn,
                              precision=event_precision, recall=event_recall, f1=event_f1)
 
-        print(
+        self._log(
             "test point-wise metrics: "
             "Acc={acc:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**point_metrics)
-        )
-        print(
+        , setting=setting)
+        self._log(
             "test event-level metrics (one-to-one overlap): "
             "TP={tp}, FP={fp}, FN={fn}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}".format(**event_metrics)
-        )
+        , setting=setting)
 
         # result save
         folder_path = './results/' + setting + '/'
