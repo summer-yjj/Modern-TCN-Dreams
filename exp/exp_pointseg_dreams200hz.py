@@ -1,10 +1,12 @@
-from exp.exp_pointseg_dreams200 import Exp_PointSeg_Dreams200
+from exp.exp_pointseg import Exp_PointSeg
+from data_provider.data_factory_dreams200 import data_provider_dreams200
 
 
-class Exp_PointSeg_Dreams200Hz(Exp_PointSeg_Dreams200):
+class Exp_PointSeg_Dreams200Hz(Exp_PointSeg):
     """
-    200Hz DREAMS 适配实验类（别名类）：
-    继承 Exp_PointSeg_Dreams200 的数据读取与训练流程，
-    并共享 Exp_PointSeg 中新增的 CSV 指标导出与运行日志导出。
+    200Hz DREAMS 适配实验类：
+    复用 Exp_PointSeg 训练/验证/测试逻辑，只替换数据读取入口。
     """
-    pass
+
+    def _get_data(self, flag):
+        return data_provider_dreams200(self.args, flag)
