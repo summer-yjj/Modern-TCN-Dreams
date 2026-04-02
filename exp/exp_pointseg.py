@@ -8,6 +8,7 @@ from torch import optim
 import os
 import time
 import warnings
+import csv
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from utils.pointseg_plots import (
@@ -596,6 +597,42 @@ class Exp_PointSeg(Exp_Basic):
 
         return loss, preds_valid, labels_valid
 
+    def _save_history_csv(self, history: dict, save_path: str):
+        """
+        将每轮训练/验证指标保存为 CSV 表格，便于后续统计与可视化。
+        """
+        keys = ["epoch", "train_loss", "val_loss", "val_point_f1", "val_event_precision", "val_event_recall", "val_event_f1", "val_point_acc"]
+        rows = list(zip(*[history.get(k, []) for k in keys])) if history.get("epoch", []) else []
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(keys)
+            writer.writerows(rows)
+
+    def _save_test_metrics_csv(self, point_metrics: dict, event_metrics: dict, save_path: str):
+        """
+        将测试集最终 point/event 指标保存为 CSV（一行）。
+        """
+        keys = [
+            "point_acc", "point_precision", "point_recall", "point_f1",
+            "event_tp", "event_fp", "event_fn", "event_precision", "event_recall", "event_f1",
+        ]
+        row = [
+            float(point_metrics.get("acc", 0.0)),
+            float(point_metrics.get("precision", 0.0)),
+            float(point_metrics.get("recall", 0.0)),
+            float(point_metrics.get("f1", 0.0)),
+            int(event_metrics.get("tp", 0)),
+            int(event_metrics.get("fp", 0)),
+            int(event_metrics.get("fn", 0)),
+            float(event_metrics.get("precision", 0.0)),
+            float(event_metrics.get("recall", 0.0)),
+            float(event_metrics.get("f1", 0.0)),
+        ]
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(keys)
+            writer.writerow(row)
+
     def vali(self, vali_loader, criterion):
         total_loss = []
         all_preds = []
@@ -742,12 +779,6 @@ class Exp_PointSeg(Exp_Basic):
                     val_event_metrics["f1"],
                 )
             )
-            # 默认基线：事件级 F1 作为核心早停指标
-            early_stopping(-val_event_metrics["f1"], self.model, path)
-            if early_stopping.early_stop:
-                print("Early stopping")
-                break
-
             history["epoch"].append(epoch + 1)
             history["train_loss"].append(float(train_loss))
             history["val_loss"].append(float(vali_loss))
@@ -757,11 +788,19 @@ class Exp_PointSeg(Exp_Basic):
             history["val_event_recall"].append(float(val_event_metrics["recall"]))
             history["val_point_acc"].append(float(val_point_metrics["acc"]))
 
+            # 默认基线：事件级 F1 作为核心早停指标
+            early_stopping(-val_event_metrics["f1"], self.model, path)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
         plot_dir = os.path.join("./results", setting, "plots")
         plot_training_curves(history, plot_dir)
+        os.makedirs(os.path.join("./results", setting), exist_ok=True)
+        self._save_history_csv(history, os.path.join("./results", setting, "epoch_metrics.csv"))
         self.train_history = history
 
         return self.model
@@ -854,6 +893,7 @@ class Exp_PointSeg(Exp_Basic):
 
         plot_dir = os.path.join("./results", setting, "plots")
         os.makedirs(plot_dir, exist_ok=True)
+        self._save_test_metrics_csv(point_metrics, event_metrics, os.path.join("./results", setting, "test_metrics.csv"))
         if all_preds:
             y_pred = torch.cat(all_preds, dim=0).numpy()
             y_true = torch.cat(all_trues, dim=0).numpy()
